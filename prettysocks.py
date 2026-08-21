@@ -37,6 +37,7 @@ import os
 import signal
 import socket
 import sys
+import tomllib
 import warnings
 from functools import partial
 from collections.abc import Callable, Awaitable
@@ -112,6 +113,58 @@ class ProxyConfig:
 
 _LOG_LEVEL_NAMES = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
 
+DEFAULT_CONFIG_PATH = '/etc/prettysocks/config.toml'
+
+
+def _default_settings() -> dict:
+    """Built-in defaults, keyed by ProxyConfig field name. This is also the
+    set of keys accepted in the TOML config file."""
+    return {
+        'listen_host': list(LISTEN_HOST),
+        'listen_port': LISTEN_PORT,
+        'listen_backlog': LISTEN_BACKLOG,
+        'log_level': logging.getLevelName(LOGLEVEL),
+        'use_builtin_happy_eyeballs': USE_BUILTIN_HAPPY_EYEBALLS,
+        'resolution_delay': RESOLUTION_DELAY,
+        'first_address_family_count': FIRST_ADDRESS_FAMILY_COUNT,
+        'connection_attempt_delay': CONNECTION_ATTEMPT_DELAY,
+        'worker_processes': WORKER_PROCESSES,
+        'relay_buffer_size': RELAY_BUFFER_SIZE,
+    }
+
+
+_SETTING_KEYS = frozenset(_default_settings())
+
+
+def _load_config_file(path: str, *, explicit: bool) -> dict:
+    """Load settings from a TOML config file.
+
+    If the file does not exist and `path` was not explicitly requested
+    (i.e. it's the default location), this is not an error and an empty
+    dict is returned.
+    """
+    try:
+        with open(path, 'rb') as f:
+            data = tomllib.load(f)
+    except FileNotFoundError:
+        if explicit:
+            raise
+        return {}
+    except tomllib.TOMLDecodeError as e:
+        raise ValueError('invalid TOML in %s: %s' % (path, e)) from e
+    unknown = set(data) - _SETTING_KEYS
+    if unknown:
+        raise ValueError('unknown setting(s) in %s: %s' % (
+            path, ', '.join(sorted(unknown))))
+    if ('use_builtin_happy_eyeballs' in data
+            and not isinstance(data['use_builtin_happy_eyeballs'], bool)):
+        raise ValueError(
+            'use_builtin_happy_eyeballs in %s must be a boolean '
+            '(true/false)' % path)
+    if isinstance(data.get('listen_host'), str):
+        data['listen_host'] = [data['listen_host']]
+    return data
+
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -119,71 +172,119 @@ def build_arg_parser() -> argparse.ArgumentParser:
                      'outgoing connections.',
     )
     parser.add_argument(
+        '-c', '--config', metavar='PATH',
+        help='Path to a TOML config file. Settings there override the '
+             'built-in defaults, and are themselves overridden by any '
+             'other command line flags given. If this is not given '
+             'explicitly and the default path does not exist, it is '
+             'silently skipped. (default: %s)' % DEFAULT_CONFIG_PATH)
+    parser.add_argument(
         '--listen-host', action='append', metavar='HOST',
         help='Address to listen on. Can be given multiple times to listen '
              'on multiple addresses. (default: %s)' % ', '.join(LISTEN_HOST))
     parser.add_argument(
-        '-p', '--listen-port', type=int, default=LISTEN_PORT, metavar='PORT',
-        help='Port to listen on. (default: %(default)s)')
+        '-p', '--listen-port', type=int, metavar='PORT',
+        help='Port to listen on. (default: %s)' % LISTEN_PORT)
     parser.add_argument(
-        '--listen-backlog', type=int, default=LISTEN_BACKLOG, metavar='N',
-        help='Backlog for listening socket(s). (default: %(default)s)')
+        '--listen-backlog', type=int, metavar='N',
+        help='Backlog for listening socket(s). (default: %s)' % LISTEN_BACKLOG)
     parser.add_argument(
-        '--log-level', type=str.upper,
-        default=logging.getLevelName(LOGLEVEL), choices=_LOG_LEVEL_NAMES,
-        help='Logging verbosity. (default: %(default)s)')
+        '--log-level', type=str.upper, choices=_LOG_LEVEL_NAMES,
+        help='Logging verbosity. (default: %s)' % logging.getLevelName(LOGLEVEL))
     parser.add_argument(
         '--happy-eyeballs-impl', choices=['async-stagger', 'builtin'],
-        default='builtin' if USE_BUILTIN_HAPPY_EYEBALLS else 'async-stagger',
         help="Happy Eyeballs implementation to use: Python's built-in "
              "implementation (no asynchronous address resolution), or the "
-             "async-stagger module. (default: %(default)s)")
+             "async-stagger module. (default: %s)" % (
+                 'builtin' if USE_BUILTIN_HAPPY_EYEBALLS else 'async-stagger'))
     parser.add_argument(
-        '--resolution-delay', type=float, default=RESOLUTION_DELAY,
-        metavar='SECONDS',
+        '--resolution-delay', type=float, metavar='SECONDS',
         help='(async-stagger implementation only) Delay before resolving '
              'the next address family. See RFC 8305 section 8. '
-             '(default: %(default)s)')
+             '(default: %s)' % RESOLUTION_DELAY)
     parser.add_argument(
-        '--first-address-family-count', type=int,
-        default=FIRST_ADDRESS_FAMILY_COUNT, metavar='N',
+        '--first-address-family-count', type=int, metavar='N',
         help='Number of addresses of the first resolved address family to '
              'try before interleaving with the other family. See RFC 8305 '
-             'section 8. (default: %(default)s)')
+             'section 8. (default: %s)' % FIRST_ADDRESS_FAMILY_COUNT)
     parser.add_argument(
-        '--connection-attempt-delay', type=float,
-        default=CONNECTION_ATTEMPT_DELAY, metavar='SECONDS',
+        '--connection-attempt-delay', type=float, metavar='SECONDS',
         help='Delay between successive connection attempts to different '
-             'addresses. See RFC 8305 section 8. (default: %(default)s)')
+             'addresses. See RFC 8305 section 8. '
+             '(default: %s)' % CONNECTION_ATTEMPT_DELAY)
     parser.add_argument(
-        '-w', '--workers', type=int, default=WORKER_PROCESSES, metavar='N',
+        '-w', '--workers', type=int, metavar='N',
         help='Number of worker processes to run. Each worker binds the '
              'listen address/port with SO_REUSEPORT set, so the kernel '
              'distributes connections between them across CPU cores. '
-             '(default: %(default)s)')
+             '(default: %s)' % WORKER_PROCESSES)
     parser.add_argument(
-        '--relay-buffer-size', type=int, default=RELAY_BUFFER_SIZE,
-        metavar='BYTES',
+        '--relay-buffer-size', type=int, metavar='BYTES',
         help='Buffer size used to relay data between downstream and '
-             'upstream connections. (default: %(default)s)')
+             'upstream connections. (default: %s)' % RELAY_BUFFER_SIZE)
     return parser
 
 
 def parse_args(argv: list[str] | None = None) -> ProxyConfig:
     parser = build_arg_parser()
     ns = parser.parse_args(argv)
-    return ProxyConfig(
-        listen_host=ns.listen_host if ns.listen_host else list(LISTEN_HOST),
-        listen_port=ns.listen_port,
-        log_level=getattr(logging, ns.log_level),
-        use_builtin_happy_eyeballs=(ns.happy_eyeballs_impl == 'builtin'),
-        resolution_delay=ns.resolution_delay,
-        first_address_family_count=ns.first_address_family_count,
-        connection_attempt_delay=ns.connection_attempt_delay,
-        worker_processes=ns.workers,
-        relay_buffer_size=ns.relay_buffer_size,
-        listen_backlog=ns.listen_backlog,
-    )
+
+    settings = _default_settings()
+    try:
+        settings.update(_load_config_file(
+            ns.config or DEFAULT_CONFIG_PATH, explicit=ns.config is not None))
+    except FileNotFoundError:
+        parser.error('config file not found: %s' % ns.config)
+    except ValueError as e:
+        parser.error(str(e))
+
+    # Command line flags override both the config file and the built-in
+    # defaults. Only flags the user actually passed (non-None) apply here.
+    if ns.listen_host is not None:
+        settings['listen_host'] = ns.listen_host
+    if ns.listen_port is not None:
+        settings['listen_port'] = ns.listen_port
+    if ns.listen_backlog is not None:
+        settings['listen_backlog'] = ns.listen_backlog
+    if ns.log_level is not None:
+        settings['log_level'] = ns.log_level
+    if ns.happy_eyeballs_impl is not None:
+        settings['use_builtin_happy_eyeballs'] = (
+            ns.happy_eyeballs_impl == 'builtin')
+    if ns.resolution_delay is not None:
+        settings['resolution_delay'] = ns.resolution_delay
+    if ns.first_address_family_count is not None:
+        settings['first_address_family_count'] = ns.first_address_family_count
+    if ns.connection_attempt_delay is not None:
+        settings['connection_attempt_delay'] = ns.connection_attempt_delay
+    if ns.workers is not None:
+        settings['worker_processes'] = ns.workers
+    if ns.relay_buffer_size is not None:
+        settings['relay_buffer_size'] = ns.relay_buffer_size
+
+    log_level_name = str(settings['log_level']).upper()
+    if log_level_name not in _LOG_LEVEL_NAMES:
+        parser.error('invalid log_level %r (must be one of %s)' % (
+            settings['log_level'], ', '.join(_LOG_LEVEL_NAMES)))
+
+    try:
+        return ProxyConfig(
+            listen_host=list(settings['listen_host']),
+            listen_port=int(settings['listen_port']),
+            log_level=getattr(logging, log_level_name),
+            use_builtin_happy_eyeballs=bool(
+                settings['use_builtin_happy_eyeballs']),
+            resolution_delay=float(settings['resolution_delay']),
+            first_address_family_count=int(
+                settings['first_address_family_count']),
+            connection_attempt_delay=float(
+                settings['connection_attempt_delay']),
+            worker_processes=int(settings['worker_processes']),
+            relay_buffer_size=int(settings['relay_buffer_size']),
+            listen_backlog=int(settings['listen_backlog']),
+        )
+    except (TypeError, ValueError) as e:
+        parser.error('invalid configuration: %s' % e)
 
 
 IPAddressType = ipaddress.IPv4Address | ipaddress.IPv6Address

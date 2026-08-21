@@ -93,6 +93,32 @@ interfaces at port 1080 with debug logging:
 prettysocks.py --listen-host 0.0.0.0 --listen-host :: -p 1080 -w 4 --log-level DEBUG
 ```
 
+### Config file
+
+Settings can also be kept in a TOML config file, handy for running as a
+service. By default, `/etc/prettysocks/config.toml` is read if it exists
+(silently skipped if it doesn't); a different path can be given with
+`--config`, in which case a missing file is an error. Precedence is:
+built-in defaults < config file < command line flags — so a flag always
+wins over the file, and the file always wins over the defaults.
+
+The file's keys mostly match `--help`'s long option names with dashes
+replaced by underscores (`listen_host`, `listen_port`, `listen_backlog`,
+`log_level`, `resolution_delay`, `first_address_family_count`,
+`connection_attempt_delay`, `relay_buffer_size`), except for two that
+differ: `-w`/`--workers` is `worker_processes` in the file, and
+`--happy-eyeballs-impl {async-stagger,builtin}` is the boolean
+`use_builtin_happy_eyeballs` in the file. For example:
+
+```toml
+listen_host = ["0.0.0.0", "::"]
+listen_port = 1080
+log_level = "INFO"
+worker_processes = 4
+relay_buffer_size = 65536
+use_builtin_happy_eyeballs = false
+```
+
 To enjoy the benefits of Happy Eyeballs, the client software should be
 configured to pass the host name to the proxy server, instead of doing
 its own hostname resolution and passing IP addresses. For example, in

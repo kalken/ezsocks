@@ -78,8 +78,20 @@ single-stack server.
 ## Usage
 
 Just run it. By default it listens on 127.0.0.1 and ::1 port 1080, and
-prints logging output to `STDERR`. To change configuration options,
-simply edit the script: all options are near the beginning.
+prints logging output to `STDERR`. All options (listen address/port, log
+level, Happy Eyeballs implementation and tuning, worker process count,
+relay buffer size, etc.) can be overridden via command line flags; run
+`prettysocks.py --help` for the full list. The values near the beginning
+of the script are just the defaults for these flags, and can also be
+edited directly if preferred.
+
+For example, to run 4 worker processes (sharing the listen port via
+`SO_REUSEPORT`, spreading load across CPU cores) listening on all
+interfaces at port 1080 with debug logging:
+
+```
+prettysocks.py --listen-host 0.0.0.0 --listen-host :: -p 1080 -w 4 --log-level DEBUG
+```
 
 To enjoy the benefits of Happy Eyeballs, the client software should be
 configured to pass the host name to the proxy server, instead of doing

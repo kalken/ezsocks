@@ -23,13 +23,17 @@ GNU General Public License for more details.
 """
 
 
+import argparse
 import asyncio
 import collections
 import contextlib
+import dataclasses
 import enum
 import errno
 import ipaddress
 import logging
+import multiprocessing
+import os
 import signal
 import socket
 import sys
@@ -42,6 +46,16 @@ try:
 except ImportError:
     async_stagger = None
 
+try:
+    import uvloop
+except ImportError:
+    uvloop = None
+
+
+# The values below are the defaults for all settings. Every one of them can
+# also be overridden on the command line; run this script with --help for
+# details. Editing the values here just changes what the command line
+# defaults to.
 
 # ========== Configuration ==========
 
@@ -64,7 +78,112 @@ RESOLUTION_DELAY = 0.05  # seconds
 FIRST_ADDRESS_FAMILY_COUNT = 1
 CONNECTION_ATTEMPT_DELAY = 0.25  # seconds
 
+# Number of worker processes to run. Each worker binds its own listening
+# socket to the same address/port with SO_REUSEPORT set, and the kernel
+# distributes incoming connections between them, allowing the proxy to use
+# multiple CPU cores. Set to e.g. os.cpu_count() to use all cores. Requires
+# SO_REUSEPORT support (Linux, *BSD, macOS; not available on Windows).
+WORKER_PROCESSES = 1
+
+# Size, in bytes, of the buffer used to relay data between downstream and
+# upstream connections. A larger buffer means fewer read/write syscalls per
+# byte transferred, at the cost of more memory per connection.
+RELAY_BUFFER_SIZE = 2 ** 16
+
+# Backlog for listening socket(s).
+LISTEN_BACKLOG = 512
+
 # ==========
+
+
+@dataclasses.dataclass
+class ProxyConfig:
+    listen_host: list[str]
+    listen_port: int
+    log_level: int
+    use_builtin_happy_eyeballs: bool
+    resolution_delay: float
+    first_address_family_count: int
+    connection_attempt_delay: float
+    worker_processes: int
+    relay_buffer_size: int
+    listen_backlog: int
+
+
+_LOG_LEVEL_NAMES = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description='Simplistic SOCKS5 proxy with Happy Eyeballs for '
+                     'outgoing connections.',
+    )
+    parser.add_argument(
+        '--listen-host', action='append', metavar='HOST',
+        help='Address to listen on. Can be given multiple times to listen '
+             'on multiple addresses. (default: %s)' % ', '.join(LISTEN_HOST))
+    parser.add_argument(
+        '-p', '--listen-port', type=int, default=LISTEN_PORT, metavar='PORT',
+        help='Port to listen on. (default: %(default)s)')
+    parser.add_argument(
+        '--listen-backlog', type=int, default=LISTEN_BACKLOG, metavar='N',
+        help='Backlog for listening socket(s). (default: %(default)s)')
+    parser.add_argument(
+        '--log-level', type=str.upper,
+        default=logging.getLevelName(LOGLEVEL), choices=_LOG_LEVEL_NAMES,
+        help='Logging verbosity. (default: %(default)s)')
+    parser.add_argument(
+        '--happy-eyeballs-impl', choices=['async-stagger', 'builtin'],
+        default='builtin' if USE_BUILTIN_HAPPY_EYEBALLS else 'async-stagger',
+        help="Happy Eyeballs implementation to use: Python's built-in "
+             "implementation (no asynchronous address resolution), or the "
+             "async-stagger module. (default: %(default)s)")
+    parser.add_argument(
+        '--resolution-delay', type=float, default=RESOLUTION_DELAY,
+        metavar='SECONDS',
+        help='(async-stagger implementation only) Delay before resolving '
+             'the next address family. See RFC 8305 section 8. '
+             '(default: %(default)s)')
+    parser.add_argument(
+        '--first-address-family-count', type=int,
+        default=FIRST_ADDRESS_FAMILY_COUNT, metavar='N',
+        help='Number of addresses of the first resolved address family to '
+             'try before interleaving with the other family. See RFC 8305 '
+             'section 8. (default: %(default)s)')
+    parser.add_argument(
+        '--connection-attempt-delay', type=float,
+        default=CONNECTION_ATTEMPT_DELAY, metavar='SECONDS',
+        help='Delay between successive connection attempts to different '
+             'addresses. See RFC 8305 section 8. (default: %(default)s)')
+    parser.add_argument(
+        '-w', '--workers', type=int, default=WORKER_PROCESSES, metavar='N',
+        help='Number of worker processes to run. Each worker binds the '
+             'listen address/port with SO_REUSEPORT set, so the kernel '
+             'distributes connections between them across CPU cores. '
+             '(default: %(default)s)')
+    parser.add_argument(
+        '--relay-buffer-size', type=int, default=RELAY_BUFFER_SIZE,
+        metavar='BYTES',
+        help='Buffer size used to relay data between downstream and '
+             'upstream connections. (default: %(default)s)')
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> ProxyConfig:
+    parser = build_arg_parser()
+    ns = parser.parse_args(argv)
+    return ProxyConfig(
+        listen_host=ns.listen_host if ns.listen_host else list(LISTEN_HOST),
+        listen_port=ns.listen_port,
+        log_level=getattr(logging, ns.log_level),
+        use_builtin_happy_eyeballs=(ns.happy_eyeballs_impl == 'builtin'),
+        resolution_delay=ns.resolution_delay,
+        first_address_family_count=ns.first_address_family_count,
+        connection_attempt_delay=ns.connection_attempt_delay,
+        worker_processes=ns.workers,
+        relay_buffer_size=ns.relay_buffer_size,
+        listen_backlog=ns.listen_backlog,
+    )
 
 
 IPAddressType = ipaddress.IPv4Address | ipaddress.IPv6Address
@@ -270,7 +389,7 @@ class Relayer:
     def __init__(
             self,
             *,
-            bufsize=2**13,
+            bufsize=2**16,
     ) -> None:
         self._bufsize = bufsize
 
@@ -285,7 +404,6 @@ class Relayer:
                 buf = await reader.read(self._bufsize)
                 if not buf:  # EOF
                     break
-                self._logger.debug('%s passing data', log_name)
                 writer.write(buf)
                 await writer.drain()
             try:
@@ -333,6 +451,14 @@ async def closing_writer(writer: asyncio.StreamWriter):
         await writer.wait_closed()
 
 
+def _set_tcp_nodelay(writer: asyncio.StreamWriter) -> None:
+    """Disable Nagle's algorithm on the underlying socket, if applicable."""
+    sock = writer.get_extra_info('socket')
+    if sock is not None and sock.family in (socket.AF_INET, socket.AF_INET6):
+        with contextlib.suppress(OSError):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+
 async def handler(
         accept: AcceptFnType,
         connect: ConnectFnType,
@@ -344,12 +470,14 @@ async def handler(
     logger = logging.getLogger('handler')
     dname = repr(dwriter.get_extra_info('peername'))
     log_name = '{!s} <=> ()'.format(dname)
+    _set_tcp_nodelay(dwriter)
     try:
         async with contextlib.AsyncExitStack() as stack:
             logger.debug('%s received connection', log_name)
             await stack.enter_async_context(closing_writer(dwriter))
             uhost, uport, ureader, uwriter = await accept(
                 dreader, dwriter, connect)
+            _set_tcp_nodelay(uwriter)
             await stack.enter_async_context(closing_writer(uwriter))
             uname = '({!r}, {!r})'.format(uhost, uport)
             log_name = '{!s} <=> {!s}'.format(dname, uname)
@@ -399,34 +527,55 @@ async def async_stagger_connect(
     )
 
 
-async def amain():
+def _make_listening_socket(host: str, port: int, backlog: int) -> socket.socket:
+    """Create a listening socket with SO_REUSEPORT set, so that multiple
+    worker processes can share the same address/port and have the kernel
+    load-balance connections between them."""
+    family = socket.AF_INET6 if ':' in host else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if hasattr(socket, 'SO_REUSEPORT'):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    sock.bind((host, port))
+    sock.listen(backlog)
+    sock.setblocking(False)
+    return sock
+
+
+async def _serve_forever(sock: socket.socket, proxy_handler) -> None:
+    server = await asyncio.start_server(proxy_handler, sock=sock)
+    async with server:
+        await server.serve_forever()
+
+
+async def amain(config: ProxyConfig):
     loop = asyncio.get_event_loop()
     with contextlib.suppress(NotImplementedError):
         loop.add_signal_handler(signal.SIGTERM, sigterm_handler)
     acceptor = SOCKS5Acceptor()
-    relayer = Relayer()
-    if USE_BUILTIN_HAPPY_EYEBALLS:
+    relayer = Relayer(bufsize=config.relay_buffer_size)
+    if config.use_builtin_happy_eyeballs:
         connector = partial(
             builtin_happy_eyeballs_connect,
-            delay=CONNECTION_ATTEMPT_DELAY,
-            interleave=FIRST_ADDRESS_FAMILY_COUNT,
+            delay=config.connection_attempt_delay,
+            interleave=config.first_address_family_count,
         )
     else:
         if async_stagger is None:
             raise ImportError(
                 'async_stagger module is required, but cannot be imported. '
-                'To use without async_stagger, set '
-                'USE_BUILTIN_HAPPY_EYEBALLS = True in code.'
+                'To use without async_stagger, pass '
+                '--happy-eyeballs-impl builtin.'
             )
         resolver = partial(
             async_stagger.resolvers.concurrent_resolver,
-            resolution_delay=RESOLUTION_DELAY,
-            first_addr_family_count=FIRST_ADDRESS_FAMILY_COUNT,
+            resolution_delay=config.resolution_delay,
+            first_addr_family_count=config.first_address_family_count,
             raise_exc_group=True,
         )
         connector = partial(
             async_stagger_connect,
-            delay=CONNECTION_ATTEMPT_DELAY,
+            delay=config.connection_attempt_delay,
             resolver=resolver,
         )
     proxy_handler = partial(
@@ -435,18 +584,18 @@ async def amain():
         connector,
         relayer.relay,
     )
-    server = await asyncio.start_server(proxy_handler, LISTEN_HOST, LISTEN_PORT)
-    try:
-        while True:
-            await asyncio.sleep(1)
-    finally:
-        server.close()
-        await server.wait_closed()
+    sockets = [
+        _make_listening_socket(host, config.listen_port, config.listen_backlog)
+        for host in config.listen_host
+    ]
+    await asyncio.gather(*(
+        _serve_forever(sock, proxy_handler) for sock in sockets
+    ))
 
 
-def main():
+def setup_logging(log_level: int) -> None:
     rootlogger = logging.getLogger()
-    rootlogger.setLevel(LOGLEVEL)
+    rootlogger.setLevel(log_level)
     stream_formatter = logging.Formatter('%(levelname)-8s %(name)s %(message)s')
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(stream_formatter)
@@ -454,10 +603,38 @@ def main():
     logging.captureWarnings(True)
     warnings.filterwarnings('always')
 
+
+def run_worker(config: ProxyConfig) -> None:
+    setup_logging(config.log_level)
+    run = uvloop.run if uvloop is not None else asyncio.run
     try:
-        asyncio.run(amain())
+        run(amain(config))
     except (KeyboardInterrupt, SystemExit) as e:
         logging.warning('Caught %r', e)
+
+
+def main(argv: list[str] | None = None) -> None:
+    config = parse_args(argv)
+    if config.worker_processes <= 1:
+        run_worker(config)
+        return
+
+    workers = [
+        multiprocessing.Process(target=run_worker, args=(config,))
+        for _ in range(config.worker_processes)
+    ]
+    for worker in workers:
+        worker.start()
+
+    def _forward_signal(signum, _frame):
+        for worker in workers:
+            if worker.is_alive() and worker.pid is not None:
+                os.kill(worker.pid, signum)
+
+    signal.signal(signal.SIGTERM, _forward_signal)
+    signal.signal(signal.SIGINT, _forward_signal)
+    for worker in workers:
+        worker.join()
 
 
 if __name__ == '__main__':

@@ -93,6 +93,12 @@ interfaces at port 1080 with debug logging:
 prettysocks.py --listen-host 0.0.0.0 --listen-host :: -p 1080 -w 4 --log-level DEBUG
 ```
 
+`-w`/`--workers` also accepts `auto`, which resolves to one worker per CPU core
+(`os.cpu_count()`) at startup. This is not the default — the built-in default
+stays at 1 worker, so a plain `prettysocks.py` run behaves the same as before
+worker processes existed at all. Set `-w auto` explicitly, or put
+`worker_processes = "auto"` in a config file, if you want it.
+
 ### Config file
 
 Settings can also be kept in a TOML config file, handy for running as a

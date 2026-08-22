@@ -166,6 +166,16 @@ def _load_config_file(path: str, *, explicit: bool) -> dict:
     return data
 
 
+def _int_or_auto(value: str) -> int | str:
+    if value == 'auto':
+        return 'auto'
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            '%r is not an integer or "auto"' % value) from None
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description='Simplistic SOCKS5 proxy with Happy Eyeballs for '
@@ -213,10 +223,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
              'addresses. See RFC 8305 section 8. '
              '(default: %s)' % CONNECTION_ATTEMPT_DELAY)
     parser.add_argument(
-        '-w', '--workers', type=int, metavar='N',
+        '-w', '--workers', type=_int_or_auto, metavar='N|auto',
         help='Number of worker processes to run. Each worker binds the '
              'listen address/port with SO_REUSEPORT set, so the kernel '
-             'distributes connections between them across CPU cores. '
+             'distributes connections between them across CPU cores. Pass '
+             '"auto" to use one worker per CPU core (os.cpu_count()). '
              '(default: %s)' % WORKER_PROCESSES)
     parser.add_argument(
         '--relay-buffer-size', type=int, metavar='BYTES',
@@ -266,6 +277,9 @@ def parse_args(argv: list[str] | None = None) -> ProxyConfig:
     if log_level_name not in _LOG_LEVEL_NAMES:
         parser.error('invalid log_level %r (must be one of %s)' % (
             settings['log_level'], ', '.join(_LOG_LEVEL_NAMES)))
+
+    if settings['worker_processes'] == 'auto':
+        settings['worker_processes'] = os.cpu_count() or 1
 
     try:
         return ProxyConfig(

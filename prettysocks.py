@@ -718,6 +718,14 @@ def setup_logging(log_level: int) -> None:
     rootlogger.addHandler(stream_handler)
     logging.captureWarnings(True)
     warnings.filterwarnings('always')
+    # uvloop's add_signal_handler() calls the deprecated
+    # asyncio.iscoroutinefunction() internally on Python 3.13+; this is an
+    # upstream uvloop issue, not something triggered by our code.
+    warnings.filterwarnings(
+        'ignore',
+        message=r"'asyncio\.iscoroutinefunction' is deprecated",
+        category=DeprecationWarning,
+    )
 
 
 def run_worker(config: ProxyConfig) -> None:

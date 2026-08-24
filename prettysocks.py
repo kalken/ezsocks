@@ -721,6 +721,7 @@ def setup_logging(log_level: int) -> None:
 
 def run_worker(config: ProxyConfig) -> None:
     setup_logging(config.log_level)
+    logging.getLogger('config').debug('Starting with configuration: %r', config)
     run = uvloop.run if uvloop is not None else asyncio.run
     try:
         run(amain(config))

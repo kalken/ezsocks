@@ -36,7 +36,6 @@ import multiprocessing
 import os
 import signal
 import socket
-import sys
 import tomllib
 import warnings
 from functools import partial
@@ -608,9 +607,9 @@ async def handler(
         logger.error('%s exception:', log_name, exc_info=e)
 
 
-def sigterm_handler():
+def sigterm_handler(main_task: asyncio.Task) -> None:
     logging.warning('Process received SIGTERM')
-    sys.exit()
+    main_task.cancel()
 
 
 async def builtin_happy_eyeballs_connect(
@@ -665,8 +664,10 @@ async def _serve_forever(sock: socket.socket, proxy_handler) -> None:
 
 async def amain(config: ProxyConfig):
     loop = asyncio.get_event_loop()
+    main_task = asyncio.current_task()
     with contextlib.suppress(NotImplementedError):
-        loop.add_signal_handler(signal.SIGTERM, sigterm_handler)
+        loop.add_signal_handler(
+            signal.SIGTERM, partial(sigterm_handler, main_task))
     acceptor = SOCKS5Acceptor()
     relayer = Relayer(bufsize=config.relay_buffer_size)
     if config.use_builtin_happy_eyeballs:
@@ -725,7 +726,7 @@ def run_worker(config: ProxyConfig) -> None:
     run = uvloop.run if uvloop is not None else asyncio.run
     try:
         run(amain(config))
-    except (KeyboardInterrupt, SystemExit) as e:
+    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError) as e:
         logging.warning('Caught %r', e)
 
 

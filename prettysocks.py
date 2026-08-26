@@ -553,6 +553,11 @@ class Relayer:
         except:
             dtask.cancel()
             utask.cancel()
+            # Cancelling a task doesn't stop it immediately; wait for both
+            # to actually finish before this frame (their last strong
+            # reference) goes away, or they may be garbage collected while
+            # still pending.
+            await asyncio.gather(utask, dtask, return_exceptions=True)
             raise
 
 
@@ -573,6 +578,16 @@ def _set_tcp_nodelay(writer: asyncio.StreamWriter) -> None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
 
+# asyncio.start_server() runs each connection's client_connected_cb as a
+# fire-and-forget task: it is not stored anywhere, so the event loop only
+# keeps a weak reference to it. Without a strong reference elsewhere, the
+# task can be garbage collected while still pending (e.g. during a burst of
+# cancellations at shutdown), which destroys it via GeneratorExit instead of
+# a normal CancelledError and produces "Task was destroyed but it is
+# pending!" errors. Keep one here for the lifetime of each handler task.
+_connection_tasks: set[asyncio.Task] = set()
+
+
 async def handler(
         accept: AcceptFnType,
         connect: ConnectFnType,
@@ -581,6 +596,9 @@ async def handler(
         dwriter: asyncio.StreamWriter
 ) -> None:
     """Main server handler."""
+    task = asyncio.current_task()
+    _connection_tasks.add(task)
+    task.add_done_callback(_connection_tasks.discard)
     logger = logging.getLogger('handler')
     dname = repr(dwriter.get_extra_info('peername'))
     log_name = '{!s} <=> ()'.format(dname)

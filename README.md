@@ -1,158 +1,38 @@
-# prettysocks
+# ezsocks
 
-*A proxy server that makes your eyeballs happy*
+`ezsocks` is heavily based on
+[`prettysocks`](https://github.com/twisteroidambassador/prettysocks), a
+simplistic, dual-stack friendly SOCKS5 proxy server that implements Happy
+Eyeballs for outgoing connections. All credit for the original design and
+implementation goes to the upstream project; this fork builds on top of it.
 
-`prettysocks` is a simplistic, dual-stack friendly SOCKS5 proxy server
-that implements Happy Eyeballs for outgoing connections.
+## What's been updated
 
-## Motivation
-
-Pretty much all modern web browsers support Happy Eyeballs, so as to
-be a good Internet citizen. However, the same can't be said for many
-proxy server software.
-
-Install and configure [Dante proxy server][2]
-on a dual-stack server, configure your browser to use it, and hit up
-<https://ipv6-test.com/>. In **Browser - Fallback** you will see a big
-red **"no"**, and the site will advise you to
-**Upgrade your web browser**.
-Of course, it's not your browser at fault, but the proxy server's, for using
-a simple connection algorithm that has not kept up with the times.
-
-The purpose of `prettysocks` is to be a dual-stack friendly proxy server,
-so that browsers behind it still get the benefit of
-Happy Eyeballs and all the goodness of IPv6.
-
-## Features
-
-Happy Eyeballs v2 is specified in [RFC 8305][1]. There are two implementations
-of Happy Eyeballs that `prettysocks` can use: Python asyncio built-in, or
-the [`async-stagger` module][3]. Both provide the following features:
-
-* Interleaving addresses by family: connection attempts will use IPv6
-  and IPv4 addresses alternatively.
-
-* Parallel connection attempts: if a connection attempt to one address
-  does not complete quickly, another attempt to the next address is
-  started in parallel. (Delay time between attempts is fixed.)
-
-In addition, `async-stagger` also supports:
-
-* Asynchronous hostname resolution: IPv6 and IPv4 addresses for a given
-  hostname are resolved in parallel, and connection attempts start
-  before all addresses are resolved.
-
-`prettysocks` does not directly implement DNS64 and NAT64. If the
-operating system supports synthesizing IPv6 addresses via
-`getaddrinfo()`, it might be supported automatically, or it might not.
-
-### Non-features
-
-`prettysocks` does not support, and has no plan to support in the
-future, these features:
-
-* Any SOCKS5 authentication methods except "no auth"
-
-* SOCKS5 commands other than CONNECT, namely BIND and UDP-ASSOCIATE
-
-* Any access control or filtering
-
-* Any built-in provision of running as a daemon, detaching from the
-  current terminal, etc.
-
-## Requirements
-
-The `prettysocks` script itself requires Python 3.11 or higher. 
-
-If using `async-stagger`, a version >= 0.4.0 must be installed.
-
-(For Python >= 3.7, < 3.11, or `async-stagger` < 0.4.0, use commits up to
-https://github.com/twisteroidambassador/prettysocks/commit/11c646a2f4275025d4637d9c1f1329e1fc5d7e70 )
-
-`prettysocks` is written for running on Linux, but should
-work on other operating systems.
-It is most useful on a server with both IPv6 and IPv4 Internet
-connectivity, however there should be no harm in running it on a
-single-stack server.
-
-## Usage
-
-Just run it. By default it listens on 127.0.0.1 and ::1 port 1080, and
-prints logging output to `STDERR`. All options (listen address/port, log
-level, Happy Eyeballs implementation and tuning, worker process count,
-relay buffer size, etc.) can be overridden via command line flags; run
-`prettysocks.py --help` for the full list. The values near the beginning
-of the script are just the defaults for these flags, and can also be
-edited directly if preferred.
-
-For example, to run 4 worker processes (sharing the listen port via
-`SO_REUSEPORT`, spreading load across CPU cores) listening on all
-interfaces at port 1080 with debug logging:
-
-```
-prettysocks.py --listen-host 0.0.0.0 --listen-host :: -p 1080 -w 4 --log-level DEBUG
-```
-
-`-w`/`--workers` also accepts `auto`, which resolves to one worker per CPU core
-(`os.cpu_count()`) at startup. This is not the default — the built-in default
-stays at 1 worker, so a plain `prettysocks.py` run behaves the same as before
-worker processes existed at all. Set `-w auto` explicitly, or put
-`worker_processes = "auto"` in a config file, if you want it.
-
-### Config file
-
-Settings can also be kept in a TOML config file, handy for running as a
-service. By default, `/etc/prettysocks/config.toml` is read if it exists
-(silently skipped if it doesn't); a different path can be given with
-`--config`, in which case a missing file is an error. Precedence is:
-built-in defaults < config file < command line flags — so a flag always
-wins over the file, and the file always wins over the defaults.
-
-The file's keys mostly match `--help`'s long option names with dashes
-replaced by underscores (`listen_host`, `listen_port`, `listen_backlog`,
-`log_level`, `resolution_delay`, `first_address_family_count`,
-`connection_attempt_delay`, `relay_buffer_size`), except for two that
-differ: `-w`/`--workers` is `worker_processes` in the file, and
-`--happy-eyeballs-impl {async-stagger,builtin}` is the boolean
-`use_builtin_happy_eyeballs` in the file. For example:
-
-```toml
-listen_host = ["0.0.0.0", "::"]
-listen_port = 1080
-log_level = "INFO"
-worker_processes = 4
-relay_buffer_size = 65536
-use_builtin_happy_eyeballs = false
-```
-
-To enjoy the benefits of Happy Eyeballs, the client software should be
-configured to pass the host name to the proxy server, instead of doing
-its own hostname resolution and passing IP addresses. For example, in
-Firefox, **"Proxy DNS when using SOCKS v5"** must be turned on.
-
-If running as a service is desired, write a simple systemd unit
-file for it.
-
-## Remarks
-
-This project started as an attempt to implement Happy Eyeballs entirely
-in stock `asyncio`, inspired by [the implementation in `trio`.][4]
-I used the same logic for multiple projects, each time writing it from scratch,
-before finally making a standalone module
-<https://github.com/twisteroidambassador/async_stagger>, and eventually
-contributing a simpler version into Python's standard library itself.
-
-Afterwards, `prettysocks` lay forgotten for quite a while. I am now updating
-it to use these latest implementations of Happy Eyeballs, primarily as
-a testing tool for these implementations, but also in the hope that it can
-be useful as an actual proxy server.
-
-## License
-
-`prettysocks` is licensed under GNU GPL v3.
-
-
-[1]: https://tools.ietf.org/html/rfc8305
-[2]: https://www.inet.no/dante/
-[3]: https://pypi.org/project/async-stagger/
-[4]: https://github.com/python-trio/trio/pull/145/files
+- **Throughput and concurrency** — optional `uvloop` event loop, larger relay
+  buffer, `TCP_NODELAY` on both legs of each connection,
+  `serve_forever()` instead of a polling loop, dropped per-chunk debug
+  logging, and multi-process worker support (via `SO_REUSEPORT`) to use more
+  than one CPU core.
+- **Command line options** — every tunable (listen address/port, log level,
+  Happy Eyeballs implementation and timing, worker count, relay buffer size,
+  backlog) is now exposed as a CLI flag instead of requiring script edits.
+- **TOML config file support** — settings can be kept in a config file
+  (`/etc/prettysocks/config.toml` by default, or a path passed via
+  `--config`), parsed with the stdlib `tomllib` (no new dependency).
+  Precedence is defaults < config file < command line flags.
+- **`-w auto` / `worker_processes = "auto"`** — resolves to `os.cpu_count()`
+  worker processes at startup. The default remains 1 worker, so a bare
+  invocation behaves exactly as before.
+- **Resolved configuration logging** — the fully resolved configuration
+  (defaults + config file + CLI flags) is logged at `DEBUG` level on startup.
+- **Clean shutdown on `SIGTERM`** — the main task is now cancelled instead of
+  calling `sys.exit()` from the signal handler, letting `asyncio.run()` tear
+  everything down through its normal cancellation path instead of crashing
+  mid-callback.
+- **Fixed orphaned connection tasks during shutdown** — per-connection
+  handler tasks and relay sub-tasks are now properly referenced and awaited
+  on cancellation, preventing the garbage collector from reaping pending
+  tasks and producing spurious `GeneratorExit`-related crashes under load.
+- **Silenced a third-party deprecation warning** — filtered out uvloop's
+  internal use of the now-deprecated `asyncio.iscoroutinefunction()`
+  (Python 3.13+), which is an upstream uvloop issue unrelated to this code.

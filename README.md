@@ -15,7 +15,8 @@ implementation goes to the upstream project; this fork builds on top of it.
   than one CPU core.
 - **Command line options** — every tunable (listen address/port, log level,
   Happy Eyeballs implementation and timing, worker count, relay buffer size,
-  backlog) is now exposed as a CLI flag instead of requiring script edits.
+  backlog, keepalive idle time) is now exposed as a CLI flag instead of
+  requiring script edits.
 - **TOML config file support** — settings can be kept in a config file
   (`/etc/prettysocks/config.toml` by default, or a path passed via
   `--config`), parsed with the stdlib `tomllib` (no new dependency).
@@ -23,6 +24,11 @@ implementation goes to the upstream project; this fork builds on top of it.
 - **`-w auto` / `worker_processes = "auto"`** — resolves to `os.cpu_count()`
   worker processes at startup. The default remains 1 worker, so a bare
   invocation behaves exactly as before.
+- **TCP keepalive on both legs** — clients and upstream servers that
+  disappear without closing (sleep, lost network, power loss) are detected
+  and their connections dropped, instead of being held open until restart.
+  Probing starts after `--keepalive-idle` / `keepalive_idle` seconds of
+  silence (default 300, `0` disables); live idle connections are unaffected.
 - **Resolved configuration logging** — the fully resolved configuration
   (defaults + config file + CLI flags) is logged at `DEBUG` level on startup.
 - **Clean shutdown on `SIGTERM`** — the main task is now cancelled instead of

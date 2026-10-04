@@ -93,7 +93,19 @@ RELAY_BUFFER_SIZE = 2 ** 16
 # Backlog for listening socket(s).
 LISTEN_BACKLOG = 512
 
+# Seconds a connection may be idle before TCP keepalive probes are sent, on
+# both the downstream and the upstream side. A peer that has disappeared
+# without closing (client went to sleep, lost its network, ...) stops
+# answering them and the connection is dropped instead of being held
+# forever. Live idle connections are not affected. Set to 0 to disable.
+KEEPALIVE_IDLE = 300  # seconds
+
 # ==========
+
+# After KEEPALIVE_IDLE, a probe is sent every _KEEPALIVE_INTERVAL seconds and
+# the peer is considered gone after _KEEPALIVE_PROBES unanswered ones.
+_KEEPALIVE_INTERVAL = 30
+_KEEPALIVE_PROBES = 4
 
 
 @dataclasses.dataclass
@@ -108,6 +120,7 @@ class ProxyConfig:
     worker_processes: int
     relay_buffer_size: int
     listen_backlog: int
+    keepalive_idle: int
 
 
 _LOG_LEVEL_NAMES = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
@@ -129,6 +142,7 @@ def _default_settings() -> dict:
         'connection_attempt_delay': CONNECTION_ATTEMPT_DELAY,
         'worker_processes': WORKER_PROCESSES,
         'relay_buffer_size': RELAY_BUFFER_SIZE,
+        'keepalive_idle': KEEPALIVE_IDLE,
     }
 
 
@@ -232,6 +246,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         '--relay-buffer-size', type=int, metavar='BYTES',
         help='Buffer size used to relay data between downstream and '
              'upstream connections. (default: %s)' % RELAY_BUFFER_SIZE)
+    parser.add_argument(
+        '--keepalive-idle', type=int, metavar='SECONDS',
+        help='Idle time before TCP keepalive probes are sent on client and '
+             'upstream connections, so that connections to peers that have '
+             'disappeared get dropped. 0 disables keepalive. '
+             '(default: %s)' % KEEPALIVE_IDLE)
     return parser
 
 
@@ -271,6 +291,8 @@ def parse_args(argv: list[str] | None = None) -> ProxyConfig:
         settings['worker_processes'] = ns.workers
     if ns.relay_buffer_size is not None:
         settings['relay_buffer_size'] = ns.relay_buffer_size
+    if ns.keepalive_idle is not None:
+        settings['keepalive_idle'] = ns.keepalive_idle
 
     log_level_name = str(settings['log_level']).upper()
     if log_level_name not in _LOG_LEVEL_NAMES:
@@ -295,6 +317,7 @@ def parse_args(argv: list[str] | None = None) -> ProxyConfig:
             worker_processes=int(settings['worker_processes']),
             relay_buffer_size=int(settings['relay_buffer_size']),
             listen_backlog=int(settings['listen_backlog']),
+            keepalive_idle=int(settings['keepalive_idle']),
         )
     except (TypeError, ValueError) as e:
         parser.error('invalid configuration: %s' % e)
@@ -578,6 +601,29 @@ def _set_tcp_nodelay(writer: asyncio.StreamWriter) -> None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
 
+def _set_tcp_keepalive(writer: asyncio.StreamWriter, idle: int) -> None:
+    """Enable TCP keepalive on the underlying socket, if applicable."""
+    if idle <= 0:
+        return
+    sock = writer.get_extra_info('socket')
+    if sock is None or sock.family not in (socket.AF_INET, socket.AF_INET6):
+        return
+    # The idle time option is TCP_KEEPIDLE on Linux, TCP_KEEPALIVE on macOS
+    idle_opt = getattr(socket, 'TCP_KEEPIDLE', None)
+    if idle_opt is None:
+        idle_opt = getattr(socket, 'TCP_KEEPALIVE', None)
+    with contextlib.suppress(OSError):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if idle_opt is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, idle_opt, idle)
+        if hasattr(socket, 'TCP_KEEPINTVL'):
+            sock.setsockopt(
+                socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _KEEPALIVE_INTERVAL)
+        if hasattr(socket, 'TCP_KEEPCNT'):
+            sock.setsockopt(
+                socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KEEPALIVE_PROBES)
+
+
 # asyncio.start_server() runs each connection's client_connected_cb as a
 # fire-and-forget task: it is not stored anywhere, so the event loop only
 # keeps a weak reference to it. Without a strong reference elsewhere, the
@@ -593,7 +639,9 @@ async def handler(
         connect: ConnectFnType,
         relay: RelayFnType,
         dreader: asyncio.StreamReader,
-        dwriter: asyncio.StreamWriter
+        dwriter: asyncio.StreamWriter,
+        *,
+        keepalive_idle: int = 0,
 ) -> None:
     """Main server handler."""
     task = asyncio.current_task()
@@ -603,6 +651,7 @@ async def handler(
     dname = repr(dwriter.get_extra_info('peername'))
     log_name = '{!s} <=> ()'.format(dname)
     _set_tcp_nodelay(dwriter)
+    _set_tcp_keepalive(dwriter, keepalive_idle)
     try:
         async with contextlib.AsyncExitStack() as stack:
             logger.debug('%s received connection', log_name)
@@ -610,6 +659,7 @@ async def handler(
             uhost, uport, ureader, uwriter = await accept(
                 dreader, dwriter, connect)
             _set_tcp_nodelay(uwriter)
+            _set_tcp_keepalive(uwriter, keepalive_idle)
             await stack.enter_async_context(closing_writer(uwriter))
             uname = '({!r}, {!r})'.format(uhost, uport)
             log_name = '{!s} <=> {!s}'.format(dname, uname)
@@ -717,6 +767,7 @@ async def amain(config: ProxyConfig):
         acceptor.accept,
         connector,
         relayer.relay,
+        keepalive_idle=config.keepalive_idle,
     )
     sockets = [
         _make_listening_socket(host, config.listen_port, config.listen_backlog)

@@ -14,8 +14,8 @@ implementation goes to the upstream project; this fork builds on top of it.
   `SO_REUSEPORT`) to use more than one CPU core.
 - **Command line options** — every tunable (listen address/port, log level,
   Happy Eyeballs implementation and timing, worker count, relay buffer size,
-  backlog, keepalive idle time, DNS cache lifetime) is now exposed as a CLI
-  flag instead of requiring script edits.
+  backlog, keepalive idle time, DNS cache lifetime, handshake timeout) is now
+  exposed as a CLI flag instead of requiring script edits.
 - **TOML config file support** — settings can be kept in a config file
   (`/etc/ezsocks/config.toml` by default, or a path passed via
   `--config`), parsed with the stdlib `tomllib` (no new dependency).
@@ -42,6 +42,11 @@ implementation goes to the upstream project; this fork builds on top of it.
   through `getaddrinfo()`, so this is a fixed lifetime. Failed lookups are
   not cached, and each worker process keeps its own cache of up to 1024
   names.
+- **Handshake timeout** — clients that don't complete the SOCKS5
+  negotiation within `--handshake-timeout` / `handshake_timeout` seconds
+  (default 30, `0` disables) are disconnected, so connections that send
+  nothing can't pile up and use up file descriptors. Connecting to the
+  upstream server is not counted.
 - **Resolved configuration logging** — the fully resolved configuration
   (defaults + config file + CLI flags) is logged at `DEBUG` level on startup.
 - **Clean shutdown on `SIGTERM`** — the main task is now cancelled instead of

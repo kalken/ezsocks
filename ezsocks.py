@@ -93,6 +93,12 @@ RELAY_BUFFER_SIZE = 2 ** 18
 # the async-stagger Happy Eyeballs implementation. Set to 0 to disable.
 DNS_CACHE_TTL = 60  # seconds
 
+# Seconds a client gets to complete the SOCKS5 negotiation (greeting and
+# CONNECT request) before it is disconnected, so that clients that connect
+# and then send nothing can't hold connections open indefinitely. Connecting
+# to the upstream server is not counted. Set to 0 to disable.
+HANDSHAKE_TIMEOUT = 30  # seconds
+
 # Backlog for listening socket(s).
 LISTEN_BACKLOG = 512
 
@@ -129,6 +135,7 @@ class ProxyConfig:
     listen_backlog: int
     keepalive_idle: int
     dns_cache_ttl: int
+    handshake_timeout: float
 
 
 _LOG_LEVEL_NAMES = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
@@ -152,6 +159,7 @@ def _default_settings() -> dict:
         'relay_buffer_size': RELAY_BUFFER_SIZE,
         'keepalive_idle': KEEPALIVE_IDLE,
         'dns_cache_ttl': DNS_CACHE_TTL,
+        'handshake_timeout': HANDSHAKE_TIMEOUT,
     }
 
 
@@ -267,6 +275,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help='(async-stagger implementation only) Seconds to cache address '
              'resolution results for. Failed lookups are not cached. 0 '
              'disables the cache. (default: %s)' % DNS_CACHE_TTL)
+    parser.add_argument(
+        '--handshake-timeout', type=float, metavar='SECONDS',
+        help='Seconds a client gets to complete the SOCKS5 negotiation '
+             'before it is disconnected. Connecting to the upstream server '
+             'is not counted. 0 disables the timeout. '
+             '(default: %s)' % HANDSHAKE_TIMEOUT)
     return parser
 
 
@@ -310,6 +324,8 @@ def parse_args(argv: list[str] | None = None) -> ProxyConfig:
         settings['keepalive_idle'] = ns.keepalive_idle
     if ns.dns_cache_ttl is not None:
         settings['dns_cache_ttl'] = ns.dns_cache_ttl
+    if ns.handshake_timeout is not None:
+        settings['handshake_timeout'] = ns.handshake_timeout
 
     log_level_name = str(settings['log_level']).upper()
     if log_level_name not in _LOG_LEVEL_NAMES:
@@ -336,6 +352,7 @@ def parse_args(argv: list[str] | None = None) -> ProxyConfig:
             listen_backlog=int(settings['listen_backlog']),
             keepalive_idle=int(settings['keepalive_idle']),
             dns_cache_ttl=int(settings['dns_cache_ttl']),
+            handshake_timeout=float(settings['handshake_timeout']),
         )
     except (TypeError, ValueError) as e:
         parser.error('invalid configuration: %s' % e)
@@ -402,6 +419,9 @@ class SOCKS5Acceptor:
     """Negotiate with downstream SOCKS5 clients."""
     _logger = logging.getLogger('socks5')
 
+    def __init__(self, *, handshake_timeout: float | None = None) -> None:
+        self._handshake_timeout = handshake_timeout
+
     def _map_exception_to_socks5_reply(self, exc: Exception) -> SOCKS5Reply:
         if isinstance(exc, ExceptionGroup):
             replies = map(self._map_exception_to_socks5_reply, exc.exceptions)
@@ -450,68 +470,78 @@ class SOCKS5Acceptor:
         dname = repr(dwriter.get_extra_info('peername'))
         log_name = '{!s} <=> ()'.format(dname)
         try:
-            buf = await dreader.readexactly(2)  # ver, number of auth methods
-            if buf[0] != 5:
-                raise ValueError('Invalid client request version')
-            buf = await dreader.readexactly(buf[1])  # offered auth methods
-            if SOCKS5AuthType.NO_AUTH not in buf:
-                dwriter.write(b'\x05' + SOCKS5AuthType.NO_OFFERS_ACCEPTABLE)
-                dwriter.write_eof()
-                await dwriter.drain()
-                raise ValueError(
-                    'Client did not offer "no auth", offers: %r' % buf)
-            dwriter.write(b'\x05' + SOCKS5AuthType.NO_AUTH)
+            async with asyncio.timeout(self._handshake_timeout) as deadline:
+                buf = await dreader.readexactly(2)  # ver, number of auth methods
+                if buf[0] != 5:
+                    raise ValueError('Invalid client request version')
+                buf = await dreader.readexactly(buf[1])  # offered auth methods
+                if SOCKS5AuthType.NO_AUTH not in buf:
+                    dwriter.write(b'\x05' + SOCKS5AuthType.NO_OFFERS_ACCEPTABLE)
+                    dwriter.write_eof()
+                    await dwriter.drain()
+                    raise ValueError(
+                        'Client did not offer "no auth", offers: %r' % buf)
+                dwriter.write(b'\x05' + SOCKS5AuthType.NO_AUTH)
 
-            # client command
-            buf = await dreader.readexactly(4)  # ver, cmd, rsv, addr_type
-            if buf[0] != 5 or buf[2] != 0:
-                raise ValueError('%s malformed SOCKS5 command'
-                                 % log_name)
-            cmd = SOCKS5Command(buf[1:2])
-            addr_type = SOCKS5AddressType(buf[3:4])
-            if addr_type is SOCKS5AddressType.IPV4_ADDRESS:
-                uhost = ipaddress.IPv4Address(await dreader.readexactly(4))
-            elif addr_type is SOCKS5AddressType.IPV6_ADDRESS:
-                uhost = ipaddress.IPv6Address(await dreader.readexactly(16))
-            elif addr_type is SOCKS5AddressType.DOMAIN_NAME:
-                buf = await dreader.readexactly(1)  # address len
-                uhost = (await dreader.readexactly(buf[0])).decode('utf-8')
-                # Sometimes clients will pass in an IP address literal (such as
-                # "127.0.0.1" as a host name. For example, Firefox does this if
-                # network.proxy.socks_remote_dns is set to True.
-                # However, we don't bother converting them into IPv(4|6)Address
-                # objects here, since we will hand the address to connecting
-                # functions that take strings anyway.
-            else:
-                raise ValueError('%s unsupported address type %r'
-                                 % (log_name, addr_type))
-            uport = int.from_bytes(await dreader.readexactly(2), 'big')
-            log_name = '{!s} <=> ({!r}, {!r})'.format(dname, uhost, uport)
-            self._logger.debug('%s parsed target address', log_name)
-            if cmd is not SOCKS5Command.CONNECT:
+                # client command
+                buf = await dreader.readexactly(4)  # ver, cmd, rsv, addr_type
+                if buf[0] != 5 or buf[2] != 0:
+                    raise ValueError('%s malformed SOCKS5 command'
+                                     % log_name)
+                cmd = SOCKS5Command(buf[1:2])
+                addr_type = SOCKS5AddressType(buf[3:4])
+                if addr_type is SOCKS5AddressType.IPV4_ADDRESS:
+                    uhost = ipaddress.IPv4Address(await dreader.readexactly(4))
+                elif addr_type is SOCKS5AddressType.IPV6_ADDRESS:
+                    uhost = ipaddress.IPv6Address(await dreader.readexactly(16))
+                elif addr_type is SOCKS5AddressType.DOMAIN_NAME:
+                    buf = await dreader.readexactly(1)  # address len
+                    uhost = (await dreader.readexactly(buf[0])).decode('utf-8')
+                    # Sometimes clients will pass in an IP address literal (such as
+                    # "127.0.0.1" as a host name. For example, Firefox does this if
+                    # network.proxy.socks_remote_dns is set to True.
+                    # However, we don't bother converting them into IPv(4|6)Address
+                    # objects here, since we will hand the address to connecting
+                    # functions that take strings anyway.
+                else:
+                    raise ValueError('%s unsupported address type %r'
+                                     % (log_name, addr_type))
+                uport = int.from_bytes(await dreader.readexactly(2), 'big')
+                # The client is done negotiating. Connecting upstream has
+                # timeouts of its own.
+                deadline.reschedule(None)
+                log_name = '{!s} <=> ({!r}, {!r})'.format(dname, uhost, uport)
+                self._logger.debug('%s parsed target address', log_name)
+                if cmd is not SOCKS5Command.CONNECT:
+                    await self._reply(
+                        dwriter, SOCKS5Reply.COMMAND_NOT_SUPPORTED, INADDR_ANY, 0)
+                    raise ValueError(
+                        'Client command %r not supported' % cmd)
+                self._logger.info('%s received CONNECT command', log_name)
+
+                try:
+                    ureader, uwriter = await connector(uhost, uport)
+                except Exception as e:
+                    self._logger.debug(
+                        '%s Exception while connecting: %r', log_name, e)
+                    reply = self._map_exception_to_socks5_reply(e)
+                    await self._reply(dwriter, reply, INADDR_ANY, 0)
+                    raise
+
+                sockname = uwriter.get_extra_info('sockname')
+                bind_host = ipaddress.ip_address(sockname[0])
+                bind_port = sockname[1]
                 await self._reply(
-                    dwriter, SOCKS5Reply.COMMAND_NOT_SUPPORTED, INADDR_ANY, 0)
-                raise ValueError(
-                    'Client command %r not supported' % cmd)
-            self._logger.info('%s received CONNECT command', log_name)
-
-            try:
-                ureader, uwriter = await connector(uhost, uport)
-            except Exception as e:
-                self._logger.debug(
-                    '%s Exception while connecting: %r', log_name, e)
-                reply = self._map_exception_to_socks5_reply(e)
-                await self._reply(dwriter, reply, INADDR_ANY, 0)
-                raise
-
-            sockname = uwriter.get_extra_info('sockname')
-            bind_host = ipaddress.ip_address(sockname[0])
-            bind_port = sockname[1]
-            await self._reply(
-                dwriter, SOCKS5Reply.SUCCESS, bind_host, bind_port)
-            return uhost, uport, ureader, uwriter
+                    dwriter, SOCKS5Reply.SUCCESS, bind_host, bind_port)
+                return uhost, uport, ureader, uwriter
         except asyncio.IncompleteReadError as e:
             raise ValueError('Client did not complete negotiation') from e
+        except TimeoutError as e:
+            if deadline.expired():
+                raise ValueError(
+                    'Client did not complete negotiation within %ss'
+                    % self._handshake_timeout) from e
+            raise
 
     async def _reply(
             self,
@@ -880,7 +910,8 @@ async def amain(config: ProxyConfig):
     with contextlib.suppress(NotImplementedError):
         loop.add_signal_handler(
             signal.SIGTERM, partial(sigterm_handler, main_task))
-    acceptor = SOCKS5Acceptor()
+    acceptor = SOCKS5Acceptor(
+        handshake_timeout=config.handshake_timeout or None)
     relayer = Relayer(bufsize=config.relay_buffer_size)
     if config.use_builtin_happy_eyeballs:
         connector = partial(

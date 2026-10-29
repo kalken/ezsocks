@@ -17,7 +17,7 @@ implementation goes to the upstream project; this fork builds on top of it.
   backlog, keepalive idle time, DNS cache lifetime) is now exposed as a CLI
   flag instead of requiring script edits.
 - **TOML config file support** — settings can be kept in a config file
-  (`/etc/prettysocks/config.toml` by default, or a path passed via
+  (`/etc/ezsocks/config.toml` by default, or a path passed via
   `--config`), parsed with the stdlib `tomllib` (no new dependency).
   Precedence is defaults < config file < command line flags.
 - **`-w auto` / `worker_processes = "auto"`** — resolves to `os.cpu_count()`

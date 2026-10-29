@@ -133,7 +133,7 @@ class ProxyConfig:
 
 _LOG_LEVEL_NAMES = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
 
-DEFAULT_CONFIG_PATH = '/etc/prettysocks/config.toml'
+DEFAULT_CONFIG_PATH = '/etc/ezsocks/config.toml'
 
 
 def _default_settings() -> dict:

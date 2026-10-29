@@ -4,7 +4,7 @@
 [`prettysocks`](https://github.com/twisteroidambassador/prettysocks), a
 simplistic, dual-stack friendly SOCKS5 proxy server that implements Happy
 Eyeballs for outgoing connections. All credit for the original design and
-implementation goes to the upstream project; this fork builds on top of it.
+implementation goes to the upstream project; ezsocks builds on top of it.
 
 ## What's been updated
 

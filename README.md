@@ -8,11 +8,10 @@ implementation goes to the upstream project; this fork builds on top of it.
 
 ## What's been updated
 
-- **Throughput and concurrency** — optional `uvloop` event loop, larger relay
-  buffer, `TCP_NODELAY` on both legs of each connection,
-  `serve_forever()` instead of a polling loop, dropped per-chunk debug
-  logging, and multi-process worker support (via `SO_REUSEPORT`) to use more
-  than one CPU core.
+- **Throughput and concurrency** — larger relay buffer, `TCP_NODELAY` on
+  both legs of each connection, `serve_forever()` instead of a polling loop,
+  dropped per-chunk debug logging, and multi-process worker support (via
+  `SO_REUSEPORT`) to use more than one CPU core.
 - **Command line options** — every tunable (listen address/port, log level,
   Happy Eyeballs implementation and timing, worker count, relay buffer size,
   backlog, keepalive idle time) is now exposed as a CLI flag instead of
@@ -39,6 +38,3 @@ implementation goes to the upstream project; this fork builds on top of it.
   handler tasks and relay sub-tasks are now properly referenced and awaited
   on cancellation, preventing the garbage collector from reaping pending
   tasks and producing spurious `GeneratorExit`-related crashes under load.
-- **Silenced a third-party deprecation warning** — filtered out uvloop's
-  internal use of the now-deprecated `asyncio.iscoroutinefunction()`
-  (Python 3.13+), which is an upstream uvloop issue unrelated to this code.

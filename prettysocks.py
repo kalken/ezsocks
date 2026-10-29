@@ -46,11 +46,6 @@ try:
 except ImportError:
     async_stagger = None
 
-try:
-    import uvloop
-except ImportError:
-    uvloop = None
-
 
 # The values below are the defaults for all settings. Every one of them can
 # also be overridden on the command line; run this script with --help for
@@ -787,22 +782,13 @@ def setup_logging(log_level: int) -> None:
     rootlogger.addHandler(stream_handler)
     logging.captureWarnings(True)
     warnings.filterwarnings('always')
-    # uvloop's add_signal_handler() calls the deprecated
-    # asyncio.iscoroutinefunction() internally on Python 3.13+; this is an
-    # upstream uvloop issue, not something triggered by our code.
-    warnings.filterwarnings(
-        'ignore',
-        message=r"'asyncio\.iscoroutinefunction' is deprecated",
-        category=DeprecationWarning,
-    )
 
 
 def run_worker(config: ProxyConfig) -> None:
     setup_logging(config.log_level)
     logging.getLogger('config').debug('Starting with configuration: %r', config)
-    run = uvloop.run if uvloop is not None else asyncio.run
     try:
-        run(amain(config))
+        asyncio.run(amain(config))
     except (KeyboardInterrupt, SystemExit, asyncio.CancelledError) as e:
         logging.warning('Caught %r', e)
 

@@ -80,10 +80,18 @@ CONNECTION_ATTEMPT_DELAY = 0.25  # seconds
 # SO_REUSEPORT support (Linux, *BSD, macOS; not available on Windows).
 WORKER_PROCESSES = 1
 
-# Size, in bytes, of the buffer used to relay data between downstream and
-# upstream connections. A larger buffer means fewer read/write syscalls per
-# byte transferred, at the cost of more memory per connection.
-RELAY_BUFFER_SIZE = 2 ** 16
+# Amount of data, in bytes, that may be waiting to be sent to one side of a
+# relayed connection before reading from the other side is paused. A larger
+# buffer keeps fast links busy with fewer pause/resume cycles, at the cost of
+# more memory per connection.
+RELAY_BUFFER_SIZE = 2 ** 18
+
+# Seconds to cache the results of address resolution for. getaddrinfo() does
+# not report the real DNS TTL, so this is a fixed lifetime: short enough to
+# follow hosts that move between servers, long enough to absorb a burst of
+# connections to the same host. Failed lookups are not cached. Only used by
+# the async-stagger Happy Eyeballs implementation. Set to 0 to disable.
+DNS_CACHE_TTL = 60  # seconds
 
 # Backlog for listening socket(s).
 LISTEN_BACKLOG = 512
@@ -102,6 +110,10 @@ KEEPALIVE_IDLE = 300  # seconds
 _KEEPALIVE_INTERVAL = 30
 _KEEPALIVE_PROBES = 4
 
+# Maximum number of host names kept in the address resolution cache. When
+# full, the least recently used entry is dropped.
+_DNS_CACHE_MAX_ENTRIES = 1024
+
 
 @dataclasses.dataclass
 class ProxyConfig:
@@ -116,6 +128,7 @@ class ProxyConfig:
     relay_buffer_size: int
     listen_backlog: int
     keepalive_idle: int
+    dns_cache_ttl: int
 
 
 _LOG_LEVEL_NAMES = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
@@ -138,6 +151,7 @@ def _default_settings() -> dict:
         'worker_processes': WORKER_PROCESSES,
         'relay_buffer_size': RELAY_BUFFER_SIZE,
         'keepalive_idle': KEEPALIVE_IDLE,
+        'dns_cache_ttl': DNS_CACHE_TTL,
     }
 
 
@@ -239,14 +253,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
              '(default: %s)' % WORKER_PROCESSES)
     parser.add_argument(
         '--relay-buffer-size', type=int, metavar='BYTES',
-        help='Buffer size used to relay data between downstream and '
-             'upstream connections. (default: %s)' % RELAY_BUFFER_SIZE)
+        help='Amount of data that may be waiting to be sent to one side of '
+             'a relayed connection before reading from the other side is '
+             'paused. (default: %s)' % RELAY_BUFFER_SIZE)
     parser.add_argument(
         '--keepalive-idle', type=int, metavar='SECONDS',
         help='Idle time before TCP keepalive probes are sent on client and '
              'upstream connections, so that connections to peers that have '
              'disappeared get dropped. 0 disables keepalive. '
              '(default: %s)' % KEEPALIVE_IDLE)
+    parser.add_argument(
+        '--dns-cache-ttl', type=int, metavar='SECONDS',
+        help='(async-stagger implementation only) Seconds to cache address '
+             'resolution results for. Failed lookups are not cached. 0 '
+             'disables the cache. (default: %s)' % DNS_CACHE_TTL)
     return parser
 
 
@@ -288,6 +308,8 @@ def parse_args(argv: list[str] | None = None) -> ProxyConfig:
         settings['relay_buffer_size'] = ns.relay_buffer_size
     if ns.keepalive_idle is not None:
         settings['keepalive_idle'] = ns.keepalive_idle
+    if ns.dns_cache_ttl is not None:
+        settings['dns_cache_ttl'] = ns.dns_cache_ttl
 
     log_level_name = str(settings['log_level']).upper()
     if log_level_name not in _LOG_LEVEL_NAMES:
@@ -313,6 +335,7 @@ def parse_args(argv: list[str] | None = None) -> ProxyConfig:
             relay_buffer_size=int(settings['relay_buffer_size']),
             listen_backlog=int(settings['listen_backlog']),
             keepalive_idle=int(settings['keepalive_idle']),
+            dns_cache_ttl=int(settings['dns_cache_ttl']),
         )
     except (TypeError, ValueError) as e:
         parser.error('invalid configuration: %s' % e)
@@ -514,43 +537,114 @@ class SOCKS5Acceptor:
                            dwriter.get_extra_info('peername'), reply)
 
 
-class Relayer:
-    """Relay data between two (StreamReader, StreamWriter) pairs."""
+class _RelayProtocol(asyncio.Protocol):
+    """One end of a relayed connection.
+
+    Installed on a transport in place of its StreamReaderProtocol once the
+    SOCKS5 negotiation is done. Data received is written straight to the
+    peer's transport from the event loop callback, without going through
+    StreamReader buffers or waking up a coroutine per chunk. Flow control
+    is passed through: when the peer's write buffer fills up, reading from
+    this side is paused until it drains.
+    """
     _logger = logging.getLogger('relay')
 
     def __init__(
             self,
-            *,
-            bufsize=2**16,
-    ) -> None:
-        self._bufsize = bufsize
-
-    async def _relay_data_side(
-            self,
-            reader: asyncio.StreamReader,
-            writer: asyncio.StreamWriter,
+            transport: asyncio.Transport,
+            done: asyncio.Future,
             log_name: str,
     ) -> None:
-        try:
-            while True:
-                buf = await reader.read(self._bufsize)
-                if not buf:  # EOF
-                    break
-                writer.write(buf)
-                await writer.drain()
+        self.transport = transport
+        self.peer: _RelayProtocol | None = None
+        self.eof = False
+        self._done = done
+        self._log_name = log_name
+        self._original = transport.get_protocol()
+
+    def take_over(self, bufsize: int) -> None:
+        self.transport.set_protocol(self)
+        self.transport.set_write_buffer_limits(high=bufsize)
+        # StreamReaderProtocol may have paused reading if its buffer filled
+        # up. Pausing is ours to manage from here on.
+        if not self.transport.is_closing() and not self.transport.is_reading():
+            self.transport.resume_reading()
+
+    def flush_stream_reader(self, reader: asyncio.StreamReader) -> None:
+        """Pass on whatever `reader` received before we took over: data the
+        client sent right behind its CONNECT request, a server's greeting,
+        or an EOF."""
+        # StreamReader has no public API to take buffered data synchronously.
+        buffered = reader._buffer
+        if buffered:
+            data = bytes(buffered)
+            buffered.clear()
+            self.data_received(data)
+        exc = reader.exception()
+        if exc is not None:
+            self._finish(exc)
+        elif reader.at_eof():
+            self.eof_received()
+        elif self.transport.is_closing():
+            self._finish(ConnectionResetError(
+                '%s connection closed during negotiation' % self._log_name))
+
+    def data_received(self, data: bytes) -> None:
+        # The peer may already be gone, with the relay winding down.
+        if not self.peer.transport.is_closing():
+            self.peer.transport.write(data)
+
+    def eof_received(self) -> bool:
+        self.eof = True
+        peer_transport = self.peer.transport
+        if not peer_transport.is_closing():
+            self._logger.debug('%s passing EOF', self._log_name)
             try:
-                self._logger.debug('%s passing EOF', log_name)
-                writer.write_eof()
-                await writer.drain()
+                peer_transport.write_eof()
             except OSError as e:
-                if e.errno == errno.ENOTCONN:
-                    self._logger.debug(
-                        '%s endpoint already closed when passing EOF', log_name)
-                    return
-                raise
-        except Exception as e:
-            self._logger.info('%s caught exception: %r', log_name, e)
-            raise
+                if e.errno != errno.ENOTCONN:
+                    self._finish(e)
+                    return True
+                self._logger.debug(
+                    '%s endpoint already closed when passing EOF',
+                    self._log_name)
+        if self.peer.eof:
+            self._finish()
+        # Keep the transport open: the other direction may still be relaying.
+        return True
+
+    def pause_writing(self) -> None:
+        if not self.peer.transport.is_closing():
+            self.peer.transport.pause_reading()
+
+    def resume_writing(self) -> None:
+        if not self.peer.transport.is_closing():
+            self.peer.transport.resume_reading()
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        # Let the original protocol see the close too, so that
+        # StreamWriter.wait_closed() still completes.
+        self._original.connection_lost(exc)
+        self._finish(exc)
+
+    def _finish(self, exc: Exception | None = None) -> None:
+        if self._done.done():
+            return
+        if exc is None:
+            self._done.set_result(None)
+        else:
+            self._done.set_exception(exc)
+
+
+class Relayer:
+    """Relay data between two (StreamReader, StreamWriter) pairs."""
+
+    def __init__(
+            self,
+            *,
+            bufsize=2**18,
+    ) -> None:
+        self._bufsize = bufsize
 
     async def relay(
             self,
@@ -560,23 +654,25 @@ class Relayer:
             uwriter: asyncio.StreamWriter,
             uname: str,
     ) -> None:
-        """Pass data from dreader to uwriter, and ureader to dwriter."""
+        """Pass data from dreader to uwriter, and ureader to dwriter.
+
+        Returns once EOF has been passed in both directions, or either
+        connection is lost (raising the error, if any).
+        """
         dname = repr(dwriter.get_extra_info('peername'))
-        utask = asyncio.create_task(self._relay_data_side(
-            dreader, uwriter, '{!s} --> {!s}'.format(dname, uname)))
-        dtask = asyncio.create_task(self._relay_data_side(
-            ureader, dwriter, '{!s} <-- {!s}'.format(dname, uname)))
-        try:
-            await asyncio.gather(utask, dtask)
-        except:
-            dtask.cancel()
-            utask.cancel()
-            # Cancelling a task doesn't stop it immediately; wait for both
-            # to actually finish before this frame (their last strong
-            # reference) goes away, or they may be garbage collected while
-            # still pending.
-            await asyncio.gather(utask, dtask, return_exceptions=True)
-            raise
+        done = asyncio.get_running_loop().create_future()
+        down = _RelayProtocol(
+            dwriter.transport, done, '{!s} --> {!s}'.format(dname, uname))
+        up = _RelayProtocol(
+            uwriter.transport, done, '{!s} <-- {!s}'.format(dname, uname))
+        down.peer, up.peer = up, down
+        # Install both protocols before passing on any buffered data, so
+        # that flow control callbacks it triggers reach us.
+        down.take_over(self._bufsize)
+        up.take_over(self._bufsize)
+        down.flush_stream_reader(dreader)
+        up.flush_stream_reader(ureader)
+        await done
 
 
 @contextlib.asynccontextmanager
@@ -689,6 +785,59 @@ async def builtin_happy_eyeballs_connect(
     )
 
 
+class DNSCache:
+    """Cache getaddrinfo() results for a fixed amount of time.
+
+    Concurrent lookups of the same name share one getaddrinfo() call. Each
+    call runs to completion even if every caller waiting on it gives up
+    (async-stagger stops resolving as soon as a connection succeeds), so
+    its result still gets cached. Failed lookups are not cached.
+    """
+
+    def __init__(self, ttl: float, max_entries: int) -> None:
+        self._ttl = ttl
+        self._max_entries = max_entries
+        self._entries: collections.OrderedDict[tuple, tuple[float, list]] = (
+            collections.OrderedDict())
+        self._pending: dict[tuple, asyncio.Task] = {}
+
+    async def getaddrinfo(
+            self, host, port, *, family=0, type=0, proto=0, flags=0,
+    ) -> list:
+        loop = asyncio.get_running_loop()
+        key = (host, port, family, type, proto, flags)
+        entry = self._entries.get(key)
+        if entry is not None:
+            expires, addrinfos = entry
+            if loop.time() < expires:
+                self._entries.move_to_end(key)
+                return list(addrinfos)
+            del self._entries[key]
+        task = self._pending.get(key)
+        if task is None:
+            task = asyncio.ensure_future(loop.getaddrinfo(
+                host, port, family=family, type=type, proto=proto,
+                flags=flags))
+            self._pending[key] = task
+            task.add_done_callback(partial(self._lookup_done, key))
+        return list(await asyncio.shield(task))
+
+    def _lookup_done(self, key: tuple, task: asyncio.Task) -> None:
+        del self._pending[key]
+        # Calling exception() also marks it as retrieved, in case no caller
+        # was left waiting for it.
+        if task.cancelled() or task.exception() is not None:
+            return
+        addrinfos = task.result()
+        if not addrinfos:
+            return
+        self._entries[key] = (
+            asyncio.get_running_loop().time() + self._ttl, addrinfos)
+        self._entries.move_to_end(key)
+        if len(self._entries) > self._max_entries:
+            self._entries.popitem(last=False)
+
+
 async def async_stagger_connect(
         host: HostType,
         port: int,
@@ -746,11 +895,16 @@ async def amain(config: ProxyConfig):
                 'To use without async_stagger, pass '
                 '--happy-eyeballs-impl builtin.'
             )
+        resolver_kwargs = {}
+        if config.dns_cache_ttl > 0:
+            dns_cache = DNSCache(config.dns_cache_ttl, _DNS_CACHE_MAX_ENTRIES)
+            resolver_kwargs['getaddrinfo_async'] = dns_cache.getaddrinfo
         resolver = partial(
             async_stagger.resolvers.concurrent_resolver,
             resolution_delay=config.resolution_delay,
             first_addr_family_count=config.first_address_family_count,
             raise_exc_group=True,
+            **resolver_kwargs,
         )
         connector = partial(
             async_stagger_connect,

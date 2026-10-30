@@ -75,6 +75,32 @@ Python's own Happy Eyeballs implementation instead (the DNS cache is not
 available then). Run `python3 ezsocks.py --help` for all options; each
 one can also be set in a TOML config file, see below.
 
+## Configuration
+
+Settings are read from `/etc/ezsocks/config.toml` if it exists, or from
+the file given with `-c` / `--config`. Command line flags override the
+config file. Unknown keys are an error. An example with every setting at
+its default:
+
+```toml
+listen_host = ["127.0.0.1", "::1"]
+listen_port = 1080
+listen_backlog = 512
+log_level = "INFO"                  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+use_builtin_happy_eyeballs = false  # true = --happy-eyeballs-impl builtin
+resolution_delay = 0.05             # seconds
+first_address_family_count = 1
+connection_attempt_delay = 0.25     # seconds
+worker_processes = 1                # or "auto"
+relay_buffer_size = 262144          # bytes
+keepalive_idle = 300                # seconds, 0 disables
+dns_cache_ttl = 60                  # seconds, 0 disables
+handshake_timeout = 30              # seconds, 0 disables
+```
+
+At `INFO` level every connection is logged with its destination; use
+`WARNING` to log only problems.
+
 ## What's been updated
 
 - **Throughput and concurrency** — larger relay buffer, `TCP_NODELAY` on
@@ -116,6 +142,9 @@ one can also be set in a TOML config file, see below.
   (default 30, `0` disables) are disconnected, so connections that send
   nothing can't pile up and use up file descriptors. Connecting to the
   upstream server is not counted.
+- **No uvloop** — the optional uvloop support was removed. It gave no
+  noticeable speedup in benchmarks, and it broke
+  `--happy-eyeballs-impl builtin`.
 - **Resolved configuration logging** — the fully resolved configuration
   (defaults + config file + CLI flags) is logged at `DEBUG` level on startup.
 - **Clean shutdown on `SIGTERM`** — the main task is now cancelled instead of

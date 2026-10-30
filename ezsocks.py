@@ -850,7 +850,11 @@ class DNSCache:
                 flags=flags))
             self._pending[key] = task
             task.add_done_callback(partial(self._lookup_done, key))
-        return list(await asyncio.shield(task))
+        # Like asyncio.shield(), asyncio.wait() leaves the lookup running if
+        # this caller is cancelled, but it doesn't log the lookup's error
+        # when nobody is left waiting for it.
+        await asyncio.wait((task,))
+        return list(task.result())
 
     def _lookup_done(self, key: tuple, task: asyncio.Task) -> None:
         del self._pending[key]
